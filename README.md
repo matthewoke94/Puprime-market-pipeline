@@ -1,127 +1,222 @@
-# Forex Market Data Pipeline
+# PuPrime Market Data Pipeline
 
-## Business problem
+## Business Problem
 
-Forex brokers need reliable, automated market data to power dashboards, risk systems, and client-facing platforms. Pulling prices manually doesn't scale, and a pipeline that silently fails or duplicates data is worse than no pipeline at all — downstream analytics and risk decisions depend on it being correct.
+Forex brokers rely on accurate and up-to-date market data to power trading platforms, analytics dashboards, and risk management systems. Manual data collection is unreliable, and pipelines that silently fail or duplicate records can lead to incorrect business decisions and inaccurate reporting.
 
 ## Solution
 
-A fault-tolerant ETL pipeline that pulls live forex prices, validates the response before trusting it, enriches it with trading indicators, and loads it into PostgreSQL using idempotent upserts — so the pipeline can be re-run safely at any frequency without corrupting data.
+An automated ETL pipeline that extracts live forex market data from the Twelve Data API, validates every response, computes trading indicators, and loads the results into PostgreSQL using idempotent upserts. The pipeline is designed to be rerun safely without creating duplicate records.
 
 ## Outcome
 
-Processes 3 currency pairs (EUR/USD, GBP/USD, USD/JPY) per run. Network failures are retried automatically with backoff; malformed API responses and bad data (negative prices, high < low inversions) are rejected before reaching the database. Every load reports exactly how many rows were new versus duplicates, giving full visibility into pipeline behaviour on every run.
+Processes three currency pairs (EUR/USD, GBP/USD, USD/JPY) per run. Network failures are retried automatically, malformed responses are rejected before loading, and duplicate records are prevented through PostgreSQL upserts.
 
 ---
 
 ## Architecture
-## Data source
 
-[Twelve Data](https://twelvedata.com) — real-time and historical OHLCV (Open, High, Low, Close) data for forex pairs. Free tier, authenticated via API key, accessed through the `/time_series` REST endpoint.
+```text
+Twelve Data API
+        │
+        ▼
+   Extraction
+        │
+        ▼
+   Validation
+        │
+        ▼
+ Transformation
+        │
+        ▼
+ PostgreSQL (Neon)
+        │
+        ▼
+Analytics & Reporting
+```
 
-## ETL process, step by step
+---
 
-**1. Extraction (`extractor.py`)**
-- Requests the last 30 daily candles for a given symbol
-- Retries up to 3 times with increasing backoff (2s, 4s) on network timeouts or connection errors — a single dropped request doesn't fail the whole run
-- Non-retryable errors (e.g. bad API key, malformed request) fail fast instead of wasting retries
+## Data Source
 
-**2. Validation**
-Two layers, both must pass before data moves downstream:
-- **Response validation** — rejects API error payloads, missing `values` field, or empty result sets
-- **Data quality validation** — rejects rows with null timestamps, zero/negative prices, or `high < low` (a data integrity red flag that would otherwise corrupt every downstream calculation silently)
+The pipeline retrieves historical forex market data from the **Twelve Data API**.
 
-**3. Cleaning**
-- `datetime` parsed with `errors="coerce"` so malformed dates become detectable `NaT` values rather than crashing the pipeline
-- Price columns cast to `float` explicitly rather than trusting API string types
+Supported symbols:
 
-**4. Transformation (`transformer.py`)**
-| Column | Meaning |
-|---|---|
-| `daily_return` | % change in closing price vs previous day |
-| `price_range` | `high - low` |
-| `sma_7` / `sma_14` | 7-day / 14-day simple moving average of close |
-| `volatility` | 7-day rolling standard deviation of daily returns |
+- EUR/USD
+- GBP/USD
+- USD/JPY
 
-**5. Loading (`loader.py`)**
-- Upserts via `ON CONFLICT (symbol, datetime) DO NOTHING`
-- Counts rows before and after the insert to report exactly how many were new vs duplicate — not just "success"
+---
 
-**6. Orchestration (`pipeline.py`)**
-- Runs extract → transform → load independently per symbol
-- A failure on one symbol doesn't block the others
-- Logs a final summary: `X/Y symbols processed successfully`
+## ETL Process
 
-## Database schema
+### 1. Extraction (`extractor.py`)
+
+- Downloads the latest market data
+- Retries failed requests automatically
+- Stops immediately on invalid API credentials
+
+### 2. Validation
+
+The pipeline validates:
+
+- Missing API responses
+- Empty datasets
+- Missing timestamps
+- Invalid prices
+- Negative values
+- High prices lower than low prices
+
+### 3. Transformation (`transformer.py`)
+
+Calculates additional trading metrics.
+
+| Metric | Description |
+|---------|-------------|
+| Daily Return | Percentage change in closing price |
+| Price Range | High − Low |
+| SMA 7 | Seven-day moving average |
+| SMA 14 | Fourteen-day moving average |
+| Volatility | Rolling standard deviation |
+
+### 4. Loading (`loader.py`)
+
+Loads data into PostgreSQL using idempotent upserts.
+
+```sql
+ON CONFLICT(symbol, datetime)
+DO NOTHING;
+```
+
+This guarantees duplicate records are never inserted.
+
+---
+
+## Database Schema
 
 ```sql
 CREATE TABLE forex_prices (
     id SERIAL PRIMARY KEY,
     symbol VARCHAR(10) NOT NULL,
     datetime TIMESTAMP NOT NULL,
-    open NUMERIC(10, 5),
-    high NUMERIC(10, 5),
-    low NUMERIC(10, 5),
-    close NUMERIC(10, 5),
-    daily_return NUMERIC(10, 6),
-    price_range NUMERIC(10, 6),
-    sma_7 NUMERIC(10, 5),
-    sma_14 NUMERIC(10, 5),
-    volatility NUMERIC(10, 6),
+    open NUMERIC(10,5),
+    high NUMERIC(10,5),
+    low NUMERIC(10,5),
+    close NUMERIC(10,5),
+    daily_return NUMERIC(10,6),
+    price_range NUMERIC(10,6),
+    sma_7 NUMERIC(10,5),
+    sma_14 NUMERIC(10,5),
+    volatility NUMERIC(10,6),
     created_at TIMESTAMP DEFAULT NOW(),
     UNIQUE(symbol, datetime)
 );
 ```
-`UNIQUE(symbol, datetime)` is what makes loads idempotent at the database level — not just application logic.
 
-## Reliability features
+---
+
+## Reliability Features
 
 | Feature | Implementation |
-|---|---|
-| Retry with backoff | Up to 3 attempts on network errors, 2s/4s delay |
-| Response validation | Rejects malformed/error API payloads before parsing |
-| Data quality checks | Rejects negative prices, high<low rows, null timestamps |
-| Duplicate prevention | DB-level unique constraint + upsert logic |
-| Observability | Every load reports inserted vs skipped counts |
-| Structured logging | Timestamped, per-symbol log lines at every stage |
+|---------|----------------|
+| Retry Logic | Three automatic retry attempts |
+| Validation | Rejects malformed API responses |
+| Data Quality | Rejects invalid prices |
+| Duplicate Prevention | PostgreSQL upsert |
+| Structured Logging | Logs every pipeline stage |
+| Idempotency | Safe repeated execution |
 
-## Orchestration and scheduling
+---
 
-Currently runs on-demand via `python src/pipeline/pipeline.py`. Because loads are idempotent, it's safe to schedule at any frequency without risk of duplicate data — the natural next step would be a daily cron job or GitHub Actions workflow, or Airflow if orchestrating alongside other pipelines (see [Project 2](https://github.com/matthewoke94/puprime-trading-analytics) for the analytics layer this would feed).
+## Project Structure
 
-## Tech stack
+```text
+puprime-market-pipeline/
+├── src/
+│   ├── models/
+│   └── pipeline/
+├── tests/
+├── .github/
+├── README.md
+├── requirements.txt
+└── .env.example
+```
 
-- **Language:** Python 3.12
-- **Database:** PostgreSQL (Neon cloud)
-- **Libraries:** pandas, psycopg2, requests, python-dotenv
-- **Testing:** pytest
-- **Version Control:** Git/GitHub
+---
 
-## Project structure
 ## Setup
+
+Install dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
-Create `.env`:
-Run:
+
+Create a `.env` file:
+
+```env
+DATABASE_URL=your_database_url
+TWELVE_DATA_API_KEY=your_api_key
+```
+
+Run the pipeline:
+
 ```bash
 python src/pipeline/pipeline.py
 ```
 
-## Sample output
-## Known gaps / next steps
+---
 
-Being transparent about what's not yet built, rather than overstating scope:
-- No automated scheduler wired up yet (cron/Airflow) — pipeline runs on manual trigger
-- Retry logic covers network failures only, not rate-limit (HTTP 429) backoff specifically
-- No alerting on repeated pipeline failures (would be a natural extension)
+## Sample Output
 
-## Business value
+```text
+INFO - Extracting EUR/USD...
+INFO - Validation passed.
+INFO - Transformation complete.
+INFO - Inserted 30 new rows.
+INFO - Skipped 0 duplicate rows.
+INFO - Pipeline completed successfully.
+```
 
-This pipeline is the foundation layer for the rest of the portfolio: the [trading analytics dashboard](https://github.com/matthewoke94/puprime-trading-analytics) needs clean price data to benchmark trader performance against, and any future risk system needs a trustworthy, deduplicated source of market truth.
+---
+
+## Tech Stack
+
+- Python 3.12
+- PostgreSQL (Neon)
+- Pandas
+- Requests
+- Psycopg2
+- Python-dotenv
+- Pytest
+- Git
+- GitHub
+
+---
+
+## Known Improvements
+
+Future enhancements include:
+
+- Airflow orchestration
+- Automated scheduling
+- Slack/email alerts
+- Docker deployment
+- Monitoring dashboard
+
+---
+
+## Business Value
+
+This pipeline delivers clean, validated market data that can be safely consumed by downstream trading analytics and risk monitoring systems. By preventing duplicate records and validating every response before loading, it provides a dependable foundation for financial reporting and decision-making.
+
+---
 
 ## Author
 
-Matthew James — Data Engineer
-GitHub: github.com/matthewoke94
+**Matthew James**
+
+**Data Engineer**
+
+GitHub: https://github.com/matthewoke94
